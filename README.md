@@ -1,13 +1,13 @@
 # Cloudflare Nginx IP Updater
 
-A Python utility that automatically updates Cloudflare's IPv4
-and IPv6 trusted IP ranges in Nginx for real IP resolve. It
+A Python utility that automatically updates Cloudflare's trusted
+IPv4 and IPv6 IP ranges in Nginx for real IP resolution. It
 generates the configuration, tests it, and reloads Nginx if
 the test passes. If validation or reloading fails, it attempts
 to restore the previous configuration.
 
-> **Note:** This is only the first iteration of this script. Expect
-the behaviour to change dramatically.
+> **Note:** This is an early version of the script. Bugs are
+expected, and behaviour may change.
 
 ## Requirements
 
@@ -23,7 +23,7 @@ Clone the repository and install dependencies:
 
 ```bash
 git clone https://github.com/Ashintosh/cloudflare-ip-updater-nginx
-cd cloudflare-up-updater-nginx
+cd cloudflare-ip-updater-nginx
 pip install -r requirements.txt
 ```
 
@@ -38,7 +38,7 @@ sudo python3 cloudflare_nginx.py
 By default, the script uses `/etc/nginx/conf.d`. To specify another directory:
 
 ```bash
-sudo env NGINX_CONFIG_DIR=/path/to/conf.d python3 cloudfare_nginx.py
+sudo env NGINX_CONFIG_DIR=/path/to/conf.d python3 cloudflare_nginx.py
 ```
 
 The target directory must exist, and `cloudflare-ips.conf` must already exist for
@@ -73,7 +73,7 @@ The generated configuration trusts the IP ranges published by Cloudflare. To res
 visitor IP addresses, configure Nginx to use Cloudflare's CF-Connecting-IP header and
 include the generated file in your existing `http` configuration.
 
-The script's validation uses an isolated Nginx configuration containing files from `cond.d`;
+The script's validation uses an isolated Nginx configuration containing files from `conf.d`;
 it does not validate the entire production Nginx configuration. Rollback is best-effort.
 
 Cloudflare IP ranges are retrieved from:
