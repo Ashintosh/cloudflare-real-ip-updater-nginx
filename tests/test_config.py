@@ -1,11 +1,14 @@
+
+from pathlib import Path
+
 import pytest
 
 from cloudflare_nginx import (
+    cleanup,
     generate_cloudflare_config,
     generate_test_nginx_config,
-    cleanup,
     install_new_config,
-    try_restore_backup,
+    rollback_config,
 )
 
 
@@ -47,11 +50,9 @@ def test_generate_cloudflare_config_each_range_has_rule():
 
     result = generate_cloudflare_config(ip_ranges)
 
-    lines = result.splitlines()
-
     rules = [
         line
-        for line in lines
+        for line in result.splitlines()
         if line.startswith("set_real_ip_from")
     ]
 
@@ -67,29 +68,20 @@ def test_generate_test_nginx_config():
 
     assert "events {}" in result
     assert "http {" in result
-    assert "include /etc/nginx/conf.d/*.conf;" in result
+    assert "include /etc/nginx/conf.d/.cf-ips.conf.new;" in result
 
 
 def test_install_new_config(tmp_path, mocker):
-    current = tmp_path / "cloudflare-ips.conf"
-    temporary = tmp_path / ".cloudflare-ips.conf.new"
-    backup = tmp_path / ".cloudflare-ips.conf.backup"
+    current = tmp_path / "cf-ips.conf"
+    temporary = tmp_path / ".cf-ips.conf.new"
+    backup = tmp_path / ".cf-ips.conf.backup"
 
     current.write_text("old configuration")
     temporary.write_text("new configuration")
 
-    mocker.patch(
-        "cloudflare_nginx.CLOUDFLARE_CONFIG",
-        current,
-    )
-    mocker.patch(
-        "cloudflare_nginx.TEMP_CONFIG",
-        temporary,
-    )
-    mocker.patch(
-        "cloudflare_nginx.BACKUP_CONFIG",
-        backup,
-    )
+    mocker.patch("cloudflare_nginx.CLOUDFLARE_CONFIG", current)
+    mocker.patch("cloudflare_nginx.TEMP_CONFIG", temporary)
+    mocker.patch("cloudflare_nginx.BACKUP_CONFIG", backup)
 
     install_new_config()
 
@@ -99,28 +91,20 @@ def test_install_new_config(tmp_path, mocker):
 
 
 def test_install_new_config_replace_failure(tmp_path, mocker):
-    current = tmp_path / "cloudflare-ips.conf"
-    temporary = tmp_path / ".cloudflare-ips.conf.new"
-    backup = tmp_path / ".cloudflare-ips.conf.backup"
+    current = tmp_path / "cf-ips.conf"
+    temporary = tmp_path / ".cf-ips.conf.new"
+    backup = tmp_path / ".cf-ips.conf.backup"
 
     current.write_text("old configuration")
     temporary.write_text("new configuration")
 
-    mocker.patch(
-        "cloudflare_nginx.CLOUDFLARE_CONFIG",
-        current,
-    )
-    mocker.patch(
-        "cloudflare_nginx.TEMP_CONFIG",
-        temporary,
-    )
-    mocker.patch(
-        "cloudflare_nginx.BACKUP_CONFIG",
-        backup,
-    )
+    mocker.patch("cloudflare_nginx.CLOUDFLARE_CONFIG", current)
+    mocker.patch("cloudflare_nginx.TEMP_CONFIG", temporary)
+    mocker.patch("cloudflare_nginx.BACKUP_CONFIG", backup)
 
-    mocker.patch(
-        "cloudflare_nginx.Path.replace",
+    mocker.patch.object(
+        Path,
+        "replace",
         side_effect=OSError("replace failed"),
     )
 
@@ -132,56 +116,41 @@ def test_install_new_config_replace_failure(tmp_path, mocker):
     assert temporary.read_text() == "new configuration"
 
 
-def test_try_restore_backup(tmp_path, mocker):
-    current = tmp_path / "cloudflare-ips.conf"
-    backup = tmp_path / ".cloudflare-ips.conf.backup"
-    temporary = tmp_path / ".cloudflare-ips.conf.new"
+def test_rollback_config(tmp_path, mocker):
+    current = tmp_path / "cf-ips.conf"
+    backup = tmp_path / ".cf-ips.conf.backup"
+    restore = tmp_path / ".cf-ips.conf.restore"
 
     current.write_text("bad configuration")
     backup.write_text("good configuration")
 
-    mocker.patch(
-        "cloudflare_nginx.CLOUDFLARE_CONFIG",
-        current,
-    )
-    mocker.patch(
-        "cloudflare_nginx.BACKUP_CONFIG",
-        backup,
-    )
-    mocker.patch(
-        "cloudflare_nginx.TEMP_CONFIG",
-        temporary,
-    )
+    mocker.patch("cloudflare_nginx.CLOUDFLARE_CONFIG", current)
+    mocker.patch("cloudflare_nginx.BACKUP_CONFIG", backup)
+    mocker.patch("cloudflare_nginx.RESTORE_CONFIG", restore)
 
-    assert try_restore_backup() is True
+    rollback_config(had_previous_config=True)
 
     assert current.read_text() == "good configuration"
-    assert not backup.exists()
-    assert temporary.read_text() == "bad configuration"
 
 
 def test_cleanup(tmp_path, mocker):
-    temporary = tmp_path / ".cloudflare-ips.conf.new"
-    test_config = tmp_path / ".nginx-cloudflare-test.conf.tmp"
-    backup = tmp_path / ".cloudflare-ips.conf.backup"
+    temporary = tmp_path / ".cf-ips.conf.new"
+    test_config = tmp_path / ".cf-nginx.conf.tmp"
+    restore = tmp_path / ".cf-ips.conf.restore"
+    backup = tmp_path / ".cf-ips.conf.backup"
 
     temporary.write_text("temporary")
     test_config.write_text("temporary")
+    restore.write_text("temporary")
     backup.write_text("backup")
 
-    mocker.patch(
-        "cloudflare_nginx.TEMP_CONFIG",
-        temporary,
-    )
-    mocker.patch(
-        "cloudflare_nginx.TEST_NGINX_CONFIG",
-        test_config,
-    )
+    mocker.patch("cloudflare_nginx.TEMP_CONFIG", temporary)
+    mocker.patch("cloudflare_nginx.TEST_NGINX_CONFIG", test_config)
+    mocker.patch("cloudflare_nginx.RESTORE_CONFIG", restore)
 
     cleanup()
 
     assert not temporary.exists()
     assert not test_config.exists()
-
-    # The backup must survive cleanup
+    assert not restore.exists()
     assert backup.exists()

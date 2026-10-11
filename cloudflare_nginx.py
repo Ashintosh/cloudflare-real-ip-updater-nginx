@@ -1,73 +1,164 @@
 #!/usr/bin/env python3
+"""
+Update Nginx trusted-proxy settings from Cloudflare's published IP ranges.
 
+The updater downloads and validates both IPv4 and IPv6 ranges, generates an
+Nginx include file, validates the candidate and production configurations,
+then reloads Nginx. Existing configuration is backed up so failed updates can
+be rolled back.
+"""
+
+import ipaddress
 import os
 import shutil
+import stat
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
 import urllib3
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+#
+# Constants
+#
 
 CLOUDFLARE_IPV4_URL = "https://www.cloudflare.com/ips-v4/"
 CLOUDFLARE_IPV6_URL = "https://www.cloudflare.com/ips-v6/"
 
+NGINX_CONFIG = Path("/etc/nginx/nginx.conf")
 NGINX_CONFIG_DIR = Path(
     os.environ.get("NGINX_CONFIG_DIR", "/etc/nginx/conf.d")
 )
 
-CLOUDFLARE_CONFIG = NGINX_CONFIG_DIR / "cloudflare-ips.conf"
-TEMP_CONFIG = NGINX_CONFIG_DIR / ".cloudflare-ips.conf.new"
-BACKUP_CONFIG = NGINX_CONFIG_DIR / ".cloudflare-ips.conf.backup"
-TEST_NGINX_CONFIG = NGINX_CONFIG_DIR / ".nginx-cloudflare-test.conf.tmp"
+CLOUDFLARE_CONFIG = NGINX_CONFIG_DIR / "cf-ips.conf"
+TEMP_CONFIG = NGINX_CONFIG_DIR / ".cf-ips.conf.new"
+BACKUP_CONFIG = NGINX_CONFIG_DIR / ".cf-ips.conf.backup"
+RESTORE_CONFIG = NGINX_CONFIG_DIR / ".cf-ips.conf.restore"
+TEST_NGINX_CONFIG = NGINX_CONFIG_DIR / ".cf-nginx.conf.tmp"
 
 HTTP_TIMEOUT = 10
+NGINX_TIMEOUT = 10
+RELOAD_TIMEOUT = 30
 
 
 http = urllib3.PoolManager()
 
 
-# ---------------------------------------------------------------------------
-# Cloudflare
-# ---------------------------------------------------------------------------
+#
+# Exceptions
+#
 
-class CloudflareDownloadError(Exception):
-    """Raised when downloading Cloudflare IP ranges fails."""
+class HTTPDownloadError(Exception):
+    """Raised when an HTTP request fails or returns a non-200 status."""
 
+
+class EmptyResponseError(Exception):
+    """Raised when an HTTP response contains no usable IP range data."""
+
+
+class IPValidationError(Exception):
+    """Raised when downloaded CIDR data is malformed or has the wrong family."""
+
+
+class NginxReloadError(Exception):
+    """Raised when the Nginx service reload fails or times out."""
+
+
+class ConfigurationUpdateError(Exception):
+    """Raised when a configuration update cannot safely proceed."""
+
+
+#
+# Cloudflare IP Range Retrieval and Validation
+#
 
 def download(url: str) -> bytes:
-    response = http.request(
-        "GET",
-        url,
-        timeout=HTTP_TIMEOUT,
-    )
+    """
+    Fetch a URL and return its response body.
+
+    Raises:
+        HTTPDownloadError: If the request fails or the server returns a
+            non-200 status.
+        ValueError: If the successful response body is empty.
+    """
+    try:
+        response = http.request(
+            "GET",
+            url,
+            timeout=urllib3.Timeout(total=HTTP_TIMEOUT),
+        )
+    except urllib3.exceptions.HTTPError as exc:
+        raise HTTPDownloadError(
+            f"Request failed for {url}: {exc}"
+        ) from exc
 
     if response.status != 200:
-        raise CloudflareDownloadError(
+        raise HTTPDownloadError(
             f"Returned HTTP {response.status} for {url}"
         )
+
+    if not response.data:
+        raise ValueError(f"Empty HTTP response from {url}")
 
     return response.data
 
 
 def get_cloudflare_ranges(version: Literal[4, 6]) -> list[str]:
-    if version == 4:
-        url = CLOUDFLARE_IPV4_URL
-    else:
-        url = CLOUDFLARE_IPV6_URL
+    """
+    Fetch, parse, validate, and deduplicate Cloudflare CIDR ranges.
 
-    return download(url).decode("utf-8").splitlines()
+    Args:
+        version: Address family to retrieve; must be 4 or 6.
+
+    Returns:
+        Unique CIDR strings in the order supplied by the upstream endpoint.
+
+    Raises:
+        HTTPDownloadError: If the upstream request fails.
+        EmptyResponseError: If the response contains no non-empty ranges.
+        IPValidationError: If the response is not valid UTF-8 or contains an
+            invalid CIDR or a range from the wrong address family.
+    """
+    url = CLOUDFLARE_IPV4_URL if version == 4 else CLOUDFLARE_IPV6_URL
+
+    try:
+        lines = download(url).decode("utf-8").splitlines()
+
+        networks = [
+            ipaddress.ip_network(line.strip(), strict=True)
+            for line in lines
+            if line.strip()
+        ]
+
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise IPValidationError(
+            f"Invalid IP range data from {url}: {exc}"
+        ) from exc
+
+    if not networks:
+        raise EmptyResponseError(
+            f"No IP ranges returned by {url}"
+        )
+
+    for network in networks:
+        if network.version != version:
+            raise IPValidationError(
+                f"Unexpected IP version in {url}: {network}"
+            )
+
+    return list(dict.fromkeys(str(network) for network in networks))
 
 
-# ---------------------------------------------------------------------------
-# Configuration generation
-# ---------------------------------------------------------------------------
+#
+# Nginx Configuration Generation
+#
 
 def generate_cloudflare_config(ip_ranges: list[str]) -> str:
+    """Render the Nginx real-IP directives for the supplied trusted CIDRs."""
+
     separator = "#" + "=" * 40
+    current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     header = f"""\
 {separator}
@@ -76,10 +167,15 @@ def generate_cloudflare_config(ip_ranges: list[str]) -> str:
 # This file is automatically generated.
 # Any changes will be overwritten.
 #
+# Last Updated: {current_date}
+#
 # Source:
 # {CLOUDFLARE_IPV4_URL}
 # {CLOUDFLARE_IPV6_URL}
 {separator}
+
+real_ip_header CF-Connecting-IP;
+real_ip_recursive on;
 
 """
 
@@ -93,109 +189,222 @@ def generate_cloudflare_config(ip_ranges: list[str]) -> str:
 
 def generate_test_nginx_config() -> str:
     """
-    Generate a minimal nginx.conf used to test the configuration
-    files in /etc/nginx/conf.d without loading sites-enabled.
+    Build a minimal Nginx configuration for an isolated syntax check.
+
+    The isolated test assumes the real-IP module is available without
+    explicit ``load_module`` directives. The production configuration test
+    remains authoritative.
     """
 
     return f"""\
 events {{}}
 
 http {{
-    include {NGINX_CONFIG_DIR}/*.conf;
+    include {TEMP_CONFIG};
 }}
 """
 
 
-# ---------------------------------------------------------------------------
-# Nginx
-# ---------------------------------------------------------------------------
+#
+# Nginx Validation and Reload
+#
 
-class NginxReloadError(Exception):
-    """Raised when Nginx cannot be reloaded."""
+def validate_nginx_config(config_path: Path = NGINX_CONFIG) -> bool:
+    """
+    Run ``nginx -t`` against a configuration file.
 
-def check_nginx_config() -> bool:
-    result = subprocess.run(
-        [
-            "nginx",
-            "-t",
-            "-c",
-            str(TEST_NGINX_CONFIG),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    Args:
+        config_path: Nginx configuration file passed to ``nginx -c``.
 
-    if result.returncode != 0:
-        print(result.stderr)
+    Returns:
+        True if Nginx reports a valid configuration; otherwise False.
+    """
+
+    try:
+        result = subprocess.run(
+            [
+                "nginx",
+                "-t",
+                "-c",
+                str(config_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=NGINX_TIMEOUT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"ERROR: Nginx validation timed out: {config_path}")
+        return False
+
+    output = result.stdout + result.stderr
+
+    if output:
+        print(output, end="" if output.endswith("\n") else "\n")
 
     return result.returncode == 0
 
 
 def reload_nginx() -> None:
-    result = subprocess.run(
-        [
-            "systemctl",
-            "reload",
-            "nginx",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    """
+    Reload the Nginx service, raising an error if the command fails.
+
+    A timeout leaves the reload outcome uncertain; callers should follow the
+    same recovery procedure used for a reported reload failure.
+    """
+
+    try:
+        result = subprocess.run(
+            ["systemctl", "reload", "nginx"],
+            capture_output=True,
+            text=True,
+            timeout=RELOAD_TIMEOUT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise NginxReloadError(
+            "Nginx reload timed out; the reload state is uncertain."
+        ) from exc
 
     if result.returncode != 0:
+        output = result.stdout + result.stderr
         raise NginxReloadError(
-            f"Nginx reload failed:\n{result.stderr}"
+            f"Nginx reload failed:\n{output}"
         )
 
 
-# ---------------------------------------------------------------------------
-# Configuration update
-# ---------------------------------------------------------------------------
+#
+# Configuration Installation and Recovery
+#
 
-def install_new_config() -> None:
+def install_new_config() -> bool:
     """
-    Replace the current Cloudflare configuration with the new one,
-    preserving the old configuration as a backup.
+    Back up the current include, then atomically install the candidate.
+
+    The candidate and destination are in the same directory so ``replace``
+    uses a same-filesystem rename.
+
+    Returns:
+        True if an existing configuration was backed up.
+
+    Raises:
+        ConfigurationUpdateError: If a backup already exists.
+        OSError: If a filesystem operation fails.
     """
 
-    shutil.copy2(
-        CLOUDFLARE_CONFIG,
-        BACKUP_CONFIG,
-    )
+    if BACKUP_CONFIG.exists():
+        raise ConfigurationUpdateError(
+            f"Backup already exists: {BACKUP_CONFIG}. "
+            "Inspect or recover it before running another update."
+        )
+
+    had_previous_config = CLOUDFLARE_CONFIG.exists()
+
+    if had_previous_config:
+        # Retain a recoverable copy of the current file and its metadata.
+        original_stat = CLOUDFLARE_CONFIG.stat()
+        shutil.copy2(CLOUDFLARE_CONFIG, BACKUP_CONFIG)
+
+        # Keep the replacement file's permission bits consistent with the current file.
+        os.chmod(
+            TEMP_CONFIG,
+            stat.S_IMODE(original_stat.st_mode),
+        )
+
+        # Preserve ownership when the updater has sufficient privileges.
+        if os.geteuid() == 0:
+            os.chown(
+                TEMP_CONFIG,
+                original_stat.st_uid,
+                original_stat.st_gid,
+            )
+    else:
+        # Set standard readable permissions when no prior file exists.
+        os.chmod(TEMP_CONFIG, 0o644)
 
     TEMP_CONFIG.replace(CLOUDFLARE_CONFIG)
 
+    return had_previous_config
 
-def try_restore_backup() -> bool:
-    try:
-        CLOUDFLARE_CONFIG.replace(TEMP_CONFIG)
-        BACKUP_CONFIG.replace(CLOUDFLARE_CONFIG)
-    except OSError as exc:
-        print(f"ERROR: Failed to restore previous configuration: {exc}")
-        return False
+
+def rollback_config(had_previous_config: bool) -> None:
+    """
+    Restore the prior include, or remove it if this was the first install.
+
+    Copy the backup rather than moving it so the original remains available
+    if restoration or service recovery subsequently fails.
+
+    Args:
+        had_previous_config: Whether installation backed up an existing file.
+
+    Raises:
+        FileNotFoundError: If a required backup is missing.
+        OSError: If the restore operation fails.
+    """
+
+    if had_previous_config:
+        if not BACKUP_CONFIG.exists():
+            raise FileNotFoundError(
+                f"Cannot roll back: backup is missing: {BACKUP_CONFIG}"
+            )
+
+        shutil.copy2(BACKUP_CONFIG, RESTORE_CONFIG)
+        RESTORE_CONFIG.replace(CLOUDFLARE_CONFIG)
+    else:
+        # First installation has no previous file to restore.
+        CLOUDFLARE_CONFIG.unlink(missing_ok=True)
 
     print("Previous configuration restored.")
-    return True
+
+
+def remove_backup() -> None:
+    """Remove the recovery backup after a successful update or recovery."""
+
+    try:
+        BACKUP_CONFIG.unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"WARNING: Failed to remove backup: {exc}")
 
 
 def cleanup() -> None:
     """
-    Remove temporary files left by the update process.
+    Remove temporary candidate, test, and restore files.
+
+    The recovery backup is deliberately excluded so an unsuccessful recovery
+    does not destroy the last copy of the previous configuration.
     """
 
-    TEMP_CONFIG.unlink(missing_ok=True)
-    TEST_NGINX_CONFIG.unlink(missing_ok=True)
+    for path in (TEMP_CONFIG, TEST_NGINX_CONFIG, RESTORE_CONFIG):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"WARNING: Failed to remove {path}: {exc}")
 
 
-# ---------------------------------------------------------------------------
+#
 # Main
-# ---------------------------------------------------------------------------
+#
 
 def main() -> int:
+    """
+    Run one update attempt and return a process exit status.
+
+    A nonzero status indicates that retrieval, validation, installation, or
+    recovery did not complete successfully.
+    """
+
+    # Refuse to overwrite recovery data that may have been left by an
+    # interrupted run. An operator must inspect or restore it before retrying.
+    if BACKUP_CONFIG.exists():
+        print(
+            f"ERROR: Existing backup found at {BACKUP_CONFIG}. "
+            "Inspect or recover it before running this updater again."
+        )
+        return 1
+
     try:
-        # Download Cloudflare IP ranges
+        # Complete all upstream retrieval and data validation before touching
+        # the active include file.
         print("Downloading Cloudflare IPv4 ranges...")
         ipv4_ranges = get_cloudflare_ranges(4)
 
@@ -209,62 +418,120 @@ def main() -> int:
             f"and {len(ipv6_ranges)} IPv6 ranges."
         )
 
-        # Generate new configuration
+        # Render the include only after both address families are available.
         new_config = generate_cloudflare_config(cloudflare_ranges)
 
         print(f"Writing temporary configuration: {TEMP_CONFIG}")
         TEMP_CONFIG.write_text(new_config, encoding="utf-8")
 
-        # Create temporary nginx.conf
+        # Catch fragment-level syntax errors before replacing the active file.
         TEST_NGINX_CONFIG.write_text(
             generate_test_nginx_config(),
             encoding="utf-8",
         )
 
-        # Install new configuration
-        install_new_config()
+        print("Testing candidate Nginx configuration...")
 
-        # Test new configuration
-        print("Testing Nginx configuration...")
-
-        if not check_nginx_config():
+        if not validate_nginx_config(TEST_NGINX_CONFIG):
             print(
-                "ERROR: Generated Cloudflare configuration "
+                "ERROR: Candidate Cloudflare configuration "
                 "failed the Nginx syntax test."
             )
-
-            try_restore_backup()
             return 1
 
-        print("Nginx configuration test passed.")
+        # Install the candidate while retaining a recoverable copy of the old file.
+        print("Installing candidate configuration...")
+        had_previous_config = install_new_config()
 
-        # Reload Nginx
+        # Check the candidate in the context of the complete production config.
+        print("Testing production Nginx configuration...")
+
+        if not validate_nginx_config():
+            print(
+                "ERROR: Production configuration test failed. "
+                "Restoring the previous configuration."
+            )
+
+            try:
+                rollback_config(had_previous_config)
+            except OSError as exc:
+                print(
+                    f"CRITICAL: Rollback failed: {exc}. "
+                    f"Preserve and inspect {BACKUP_CONFIG}."
+                )
+                return 1
+
+            # The invalid candidate was never reloaded, so the running
+            # workers still use their previously loaded configuration.
+            remove_backup()
+            return 1
+
+        print("Production configuration test passed.")
+
+        # Apply the validated configuration only after the production test passes.
         print("Reloading Nginx...")
-        reload_nginx()
+
+        try:
+            reload_nginx()
+        except NginxReloadError as exc:
+            print(f"ERROR: {exc}")
+            print("Attempting to restore the previous configuration...")
+
+            # Restore the previous include before attempting service recovery.
+            try:
+                rollback_config(had_previous_config)
+            except OSError as rollback_exc:
+                print(
+                    f"CRITICAL: Rollback failed: {rollback_exc}. "
+                    f"Preserve and inspect {BACKUP_CONFIG}."
+                )
+                return 1
+
+            # Do not reload a restored file until the complete configuration
+            # has passed validation.
+            if not validate_nginx_config():
+                print(
+                    "CRITICAL: Restored configuration failed validation. "
+                    f"Preserve and inspect {BACKUP_CONFIG}."
+                )
+                return 1
+
+            # Reconcile the running service with the restored configuration.
+            try:
+                reload_nginx()
+            except NginxReloadError as recovery_exc:
+                print(
+                    f"CRITICAL: Recovery reload failed: {recovery_exc}. "
+                    f"Backup retained at {BACKUP_CONFIG}."
+                )
+                return 1
+
+            print("Previous configuration successfully reloaded.")
+            remove_backup()
+            return 1
 
         print("Nginx reloaded successfully.")
 
-        # New configuration is now active
-        try:
-            BACKUP_CONFIG.unlink(missing_ok=True)
-        except OSError as exc:
-            print(f"WARNING: Failed to remove backup configuration: {exc}")
+        # Retain the backup until the reload command reports success.
+        remove_backup()
 
         print("Cloudflare IP ranges updated successfully.")
         return 0
 
-    except CloudflareDownloadError as exc:
-        print(f"ERROR: Failed to download Cloudflare IP ranges: {exc}")
+    except (HTTPDownloadError, EmptyResponseError, IPValidationError) as exc:
+        print(f"ERROR: Failed to retrieve or validate Cloudflare IP ranges: {exc}")
+        return 1
+
+    except ConfigurationUpdateError as exc:
+        print(f"ERROR: {exc}")
         return 1
 
     except OSError as exc:
+        # Filesystem failures can interrupt rollback; retain any backup for
+        # inspection and manual recovery.
         print(f"ERROR: File operation failed: {exc}")
-        return 1
-
-    except NginxReloadError as exc:
-        print(f"ERROR: {exc}")
-
-        try_restore_backup()
+        if BACKUP_CONFIG.exists():
+            print(f"Recovery backup retained at {BACKUP_CONFIG}.")
         return 1
 
     finally:
