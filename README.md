@@ -1,4 +1,4 @@
-# Cloudflare Nginx IP Updater
+# Cloudflare Nginx Real IP Updater
 
 A Python utility that downloads Cloudflare's published IPv4
 and IPv6 ranges and generates an Nginx include file for
